@@ -1,3 +1,4 @@
+from os import abort
 from flask import Flask, render_template, request, redirect, url_for, session, flash, g
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
@@ -7,6 +8,9 @@ import sqlite3
 import hashlib
 import re
 from datetime import datetime
+from email_validator import validate_email, EmailNotValidError
+import phonenumbers
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -121,6 +125,66 @@ def feed():
     # Add the pagination parameters to the query arguments
     pagination_params = (POSTS_PER_PAGE, offset)
 
+    # Handle recommended posts differently
+    if sort == 'recommended':
+        # Get recommended posts (already processed by recommend function)
+        recommended_posts = recommend(current_user_id, show == 'following' and current_user_id)
+        
+        posts_data = []
+        for rec_post in recommended_posts:
+            # Get additional data for each recommended post
+            post_id = rec_post['id']
+            
+            # Determine if the current user follows the poster
+            followed_poster = False
+            if current_user_id and rec_post['user_id'] != current_user_id:
+                follow_check = query_db(
+                    'SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?',
+                    (current_user_id, rec_post['user_id']),
+                    one=True
+                )
+                if follow_check:
+                    followed_poster = True
+
+            # Determine if the current user reacted to this post
+            user_reaction = None
+            if current_user_id:
+                reaction_check = query_db(
+                    'SELECT reaction_type FROM reactions WHERE user_id = ? AND post_id = ?',
+                    (current_user_id, post_id),
+                    one=True
+                )
+                if reaction_check:
+                    user_reaction = reaction_check['reaction_type']
+
+            # Get reactions and comments
+            reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post_id,))
+            comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post_id,))
+            
+            comments_moderated = []
+            for comment in comments_raw:
+                comment_dict = dict(comment)
+                comment_dict['content'], _ = moderate_content(comment_dict['content'])
+                comments_moderated.append(comment_dict)
+            
+            posts_data.append({
+                'post': rec_post,  # Already has content moderated
+                'reactions': reactions,
+                'user_reaction': user_reaction,
+                'followed_poster': followed_poster,
+                'comments': comments_moderated
+            })
+        
+        return render_template('feed.html.j2', 
+                               posts=posts_data, 
+                               current_sort=sort,
+                               current_show=show,
+                               page=page,
+                               per_page=POSTS_PER_PAGE,
+                               reaction_emojis=REACTION_EMOJIS,
+                               reaction_types=REACTION_TYPES)
+    
+    # Handle popular and new posts (original logic)
     if sort == 'popular':
         query = f"""
             SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
@@ -136,8 +200,6 @@ def feed():
         """
         final_params = params + list(pagination_params)
         posts = query_db(query, final_params)
-    elif sort == 'recommended':
-        posts = recommend(current_user_id, show == 'following' and current_user_id)
     else:  # Default sort is 'new'
         query = f"""
             SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
@@ -196,8 +258,8 @@ def feed():
                            posts=posts_data, 
                            current_sort=sort,
                            current_show=show,
-                           page=page, # Pass current page number
-                           per_page=POSTS_PER_PAGE, # Pass items per page
+                           page=page,
+                           per_page=POSTS_PER_PAGE,
                            reaction_emojis=REACTION_EMOJIS,
                            reaction_types=REACTION_TYPES)
 
@@ -869,75 +931,429 @@ def loop_color(user_id):
 
 # ----- Functions to be implemented are below
 
-# Task 3.1
+# Task 3.3
 def recommend(user_id, filter_following):
-    """
-    Args:
-        user_id: The ID of the current user.
-        filter_following: Boolean, True if we only want to see recommendations from followed users.
-
-    Returns:
-        A list of 5 recommended posts, in reverse-chronological order.
-
-    To test whether your recommendation algorithm works, let's pretend we like the DIY topic. Here are some users that often post DIY comment and a few example posts. Make sure your account did not engage with anything else. You should test your algorithm with these and see if your recommendation algorithm picks up on your interest in DIY and starts showing related content.
+    print(f"\n=== DEBUG RECOMMEND ===")
+    print(f"user_id: {user_id}")
+    print(f"filter_following: {filter_following}")
     
-    Users: @starboy99, @DancingDolphin, @blogger_bob
-    Posts: 1810, 1875, 1880, 2113
+    # -- fallback for logged-out users
+    if not user_id:
+        print("FALLBACK: Logged-out user")
+        return query_db("""
+            SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id
+            FROM posts p
+            JOIN users u ON u.id = p.user_id
+            LEFT JOIN (SELECT post_id, COUNT(*) AS total_reactions FROM reactions GROUP BY post_id) r
+                   ON r.post_id = p.id
+            ORDER BY IFNULL(r.total_reactions,0) DESC, p.created_at DESC
+            LIMIT 5
+        """)
+
+    # -- 1) build interest profile
+    positive = ('like', 'love', 'laugh', 'wow')
+    liked = query_db(f"""
+        SELECT p.id, p.content
+        FROM posts p
+        JOIN reactions r ON r.post_id = p.id
+        WHERE r.user_id = ? AND r.reaction_type IN ({','.join('?'*len(positive))})
+    """, (user_id, *positive)) or []
     
-    Materials: 
-    - https://www.nvidia.com/en-us/glossary/recommendation-system/
-    - http://www.configworks.com/mz/handout_recsys_sac2010.pdf
-    - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
+    print(f"Liked posts count: {len(liked)}")
+
+    # -- social: who the user follows
+    follow_rows = query_db('SELECT followed_id FROM follows WHERE follower_id = ?', (user_id,)) or []
+    followed_ids = {row['followed_id'] for row in follow_rows}
+    print(f"Following count: {len(followed_ids)}")
+
+    # -- stop-words and keyword extraction
+    stop = {
+        'a','an','the','in','on','is','it','to','for','of','and','with','this','that','by','as','be','are','was','were',
+        'from','or','at','i','you','we','they','he','she','them','his','her','our','your'
+    }
+    counts = collections.Counter()
+    for row in liked:
+        words = re.findall(r'\b\w+\b', (row['content'] or "").lower())
+        for w in words:
+            if len(w) > 2 and w not in stop and not w.isdigit():
+                counts[w] += 1
+    interest_terms = [w for w, _ in counts.most_common(12)]
+    print(f"Interest keywords: {interest_terms}")
+
+    # -- 2) gather candidates
+    reacted_rows = query_db('SELECT post_id FROM reactions WHERE user_id = ?', (user_id,)) or []
+    already_seen = {r['post_id'] for r in reacted_rows}
+    print(f"Already reacted to: {len(already_seen)} posts")
+
+    where = ["p.user_id != ?"]
+    params = [user_id]
+
+    if already_seen:
+        placeholders = ",".join(["?"] * len(already_seen))
+        where.append(f"p.id NOT IN ({placeholders})")
+        params.extend(list(already_seen))
+
+    if filter_following:
+        if not followed_ids:
+            print("FALLBACK: Filter following but no follows")
+            return []
+        placeholders = ",".join(["?"] * len(followed_ids))
+        where.append(f"p.user_id IN ({placeholders})")
+        params.extend(list(followed_ids))
+
+    base_query = f"""
+        SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id,
+               IFNULL(rx.total_reactions,0) AS total_reactions
+        FROM posts p
+        JOIN users u ON u.id = p.user_id
+        LEFT JOIN (SELECT post_id, COUNT(*) AS total_reactions FROM reactions GROUP BY post_id) rx
+               ON rx.post_id = p.id
+        WHERE {' AND '.join(where)}
+        ORDER BY p.created_at DESC
+        LIMIT 200
     """
+    candidates = query_db(base_query, tuple(params)) or []
+    print(f"Candidates found: {len(candidates)}")
 
-    recommended_posts = {} 
+    # -- cold-start fallback
+    if not interest_terms and not followed_ids:
+        print("FALLBACK: Cold start (no interests, no follows)")
+        return query_db("""
+            SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id
+            FROM posts p
+            JOIN users u ON u.id = p.user_id
+            LEFT JOIN (SELECT post_id, COUNT(*) AS total_reactions FROM reactions GROUP BY post_id) r
+                   ON r.post_id = p.id
+            WHERE p.user_id != ?
+            ORDER BY IFNULL(r.total_reactions,0) DESC, p.created_at DESC
+            LIMIT 5
+        """, (user_id,))
 
-    return recommended_posts;
+    # -- 3) score candidates
+    def score_row(row):
+        text = (row['content'] or "").lower()
+        hits = 0
+        for t in interest_terms:
+            if t in text:
+                hits += 1
+        content_score = 2.0 * hits
+        social_score = 1.5 if row['user_id'] in followed_ids else 0.0
+        pop = row['total_reactions']
+        if pop >= 15: pop_score = 0.7
+        elif pop >= 7: pop_score = 0.5
+        elif pop >= 3: pop_score = 0.3
+        else: pop_score = 0.0
+        return content_score + social_score + pop_score
+
+    scored = []
+    for row in candidates:
+        s = score_row(row)
+        if s <= 0 and not filter_following and row['total_reactions'] >= 3:
+            s = 0.6
+        scored.append((s, row))
+
+    scored.sort(key=lambda x: (x[0], x[1]['created_at']), reverse=True)
+    print(f"Top 5 scores: {[s[0] for s in scored[:5]]}")
+
+    # -- 4) prepare final list
+    out = []
+    for _, row in scored[:5]:
+        clean, _ = moderate_content(row['content'])
+        out.append({
+            'id': row['id'],
+            'content': clean,
+            'created_at': row['created_at'],
+            'username': row['username'],
+            'user_id': row['user_id']
+        })
+
+    # -- last-chance fallback
+    if not out:
+        print("FALLBACK: Empty results, returning recent posts")
+        return query_db("""
+            SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id
+            FROM posts p
+            JOIN users u ON u.id = p.user_id
+            ORDER BY p.created_at DESC
+            LIMIT 5
+        """)
+
+    print(f"Returning {len(out)} recommendations")
+    print("\nRecommended Posts:")
+    for i, post in enumerate(out, 1):
+        content_preview = post['content'][:80] + "..." if len(post['content']) > 80 else post['content']
+        print(f"  {i}. Post ID: {post['id']} | Author: @{post['username']} | Content: {content_preview}")
+    print("======================\n")
+    return out
+    
 
 # Task 3.2
 def user_risk_analysis(user_id):
-    """
-    Args:
-        user_id: The ID of the user on which we perform risk analysis.
+    # -- helper: safely parse timestamps
+    def parse_ts(ts):
+        if not ts:
+            return None
+        if isinstance(ts, datetime):
+            return ts
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+            try:
+                return datetime.strptime(ts, fmt)
+            except ValueError:
+                continue
+        return None
 
-    Returns:
-        A float number score showing the risk associated with this user. There are no strict rules or bounds to this score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk. (An upper bound of 5.0 is applied to this score elsewhere in the codebase) 
-        
-        You will be able to check the scores by logging in with the administrator account:
-            username: admin
-            password: admin
-        Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
-    """
-    
-    score = 0
+    # -- fetch user record
+    user = query_db('SELECT id, profile, created_at FROM users WHERE id = ?', (user_id,), one=True)
+    if not user:
+        return 0.0
 
-    return score;
+    now = datetime.now(timezone.utc)
 
-    
-# Task 3.3
+    # -- step 1: profile_score
+    profile_text = user['profile'] or ""
+    _, profile_score = moderate_content(profile_text)
+
+    # -- step 2: average_post_score
+    posts = query_db('SELECT content, created_at FROM posts WHERE user_id = ?', (user_id,)) or []
+    post_scores = [moderate_content(p['content'] or "")[1] for p in posts]
+    average_post_score = sum(post_scores) / len(post_scores) if post_scores else 0.0
+
+    # -- step 3: average_comment_score
+    comments = query_db('SELECT content, created_at FROM comments WHERE user_id = ?', (user_id,)) or []
+    comment_scores = [moderate_content(c['content'] or "")[1] for c in comments]
+    average_comment_score = sum(comment_scores) / len(comment_scores) if comment_scores else 0.0
+
+    # -- step 4: combine scores
+    content_risk_score = (profile_score * 1.0) + (average_post_score * 3.0) + (average_comment_score * 1.0)
+
+    # -- step 5: apply account-age multiplier
+    created_at = parse_ts(user['created_at'])
+    if created_at:
+        account_age_days = (now - created_at.replace(tzinfo=timezone.utc)).days
+    else:
+        account_age_days = 999999
+
+    if account_age_days < 7:
+        user_risk_score = content_risk_score * 1.5
+    elif account_age_days < 30:
+        user_risk_score = content_risk_score * 1.2
+    else:
+        user_risk_score = content_risk_score
+
+    # -- extra rule: toxic engagement (+0.5 if >30% of comments on user's posts are moderated)
+    user_posts = query_db('SELECT id FROM posts WHERE user_id = ?', (user_id,)) or []
+    total_comments = 0
+    moderated_comments = 0
+
+    for post in user_posts:
+        rows = query_db('SELECT content FROM comments WHERE post_id = ?', (post['id'],)) or []
+        for r in rows:
+            _, s = moderate_content(r['content'] or "")
+            total_comments += 1
+            if s >= 2.0:
+                moderated_comments += 1
+
+    if total_comments > 0:
+        moderation_ratio = moderated_comments / total_comments
+        if moderation_ratio > 0.30:
+            user_risk_score += 0.5
+
+    print(f"\nUser {user_id}\nProfile Score: {profile_score}\nAvg Post Score: {average_post_score}\nAvg Comment Score: {average_comment_score}\nContent Risk: {content_risk_score}\nAccount Age Days: {account_age_days}\nFinal Risk Score: {user_risk_score}")
+    # -- step 6: final cap
+    return min(5.0, round(user_risk_score, 2))
+
+# Task 3.1
 def moderate_content(content):
-    """
-    Args
-        content: the text content of a post or comment to be moderated.
-        
-    Returns: 
-        A tuple containing the moderated content (string) and a severity score (float). There are no strict rules or bounds to the severity score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk.
-    
-    This function moderates a string of content and calculates a severity score based on
-    rules loaded from the 'censorship.dat' file. These are already loaded as TIER1_WORDS, TIER2_PHRASES and TIER3_WORDS. Tier 1 corresponds to strong profanity, Tier 2 to scam/spam phrases and Tier 3 to mild profanity.
-    
-    You will be able to check the scores by logging in with the administrator account:
-            username: admin
-            password: admin
-    Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
-    """
+    if not isinstance(content, str) or not content:
+        return "", 0.0
 
-    moderated_content = content
-    score = 0
-    
-    return moderated_content, score
+    text = content
 
+    # -- stage 1.1: fixed scoring as 5.0
+
+    # -- 1.1.1: tier1 words (whole-word, immediate removal)
+    if TIER1_WORDS:
+        pattern_t1 = r"\b(" + "|".join(map(re.escape, TIER1_WORDS)) + r")\b"
+        if re.search(pattern_t1, text, flags=re.IGNORECASE):
+            return "[content removed due to severe violation]", 5.0
+
+    # -- 1.1.2: tier2 phrases (whole-phrase, immediate removal)
+    for phrase in TIER2_PHRASES or []:
+        if re.search(re.escape(phrase), text, flags=re.IGNORECASE):
+            return "[content removed due to spam/scam policy]", 5.0
+
+    # -- stage 1.2: incremental scoring begins at 0.0
+    score = 0.0
+
+    # -- 1.2.1: tier3 words (+2 each, censor with asterisks)
+    if TIER3_WORDS:
+        pattern_t3 = r"\b(" + "|".join(map(re.escape, TIER3_WORDS)) + r")\b"
+        t3_matches = re.findall(pattern_t3, text, flags=re.IGNORECASE)
+        score += 2.0 * len(t3_matches)
+        text = re.sub(pattern_t3, lambda m: "*" * len(m.group(0)), text, flags=re.IGNORECASE)
+
+    # -- 1.2.2: external links (+2 each, replace)
+    url_pattern = r"(https?://[^\s]+)"
+    urls = re.findall(url_pattern, text)
+    if urls:
+        score += 2.0 * len(urls)
+        text = re.sub(url_pattern, "[link removed]", text)
+
+    # -- 1.2.3: excessive capitalization (+0.5 fixed)
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) > 15:
+        upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+        if upper_ratio > 0.7: # threshold 70%
+            score += 0.5
+
+    # -- 1.2.4 (extra rule - my proposal): private info disclosure (+2 each, replace)
+    hits = 0
+    valid_emails = []
+    valid_phones = []
+
+    # emails: find, validate, and count occurrences
+    email_re = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,20}\b"
+    for candidate in re.findall(email_re, text):
+        try:
+            validate_email(candidate)
+            valid_emails.append(candidate)
+            hits += 1
+        except EmailNotValidError:
+            pass
+
+    # phonenumbers: match, validate, and count occurrences
+    for match in phonenumbers.PhoneNumberMatcher(text, None):
+        if phonenumbers.is_valid_number(match.number):
+            valid_phones.append(match.raw_string)
+            hits += 1
+
+    # replace all validated emails and phones with placeholder
+    if valid_emails:
+        email_pattern = r"|".join(map(re.escape, set(valid_emails)))
+        text = re.sub(email_pattern, "[private info removed]", text)
+
+    if valid_phones:
+        phone_pattern = r"|".join(map(re.escape, set(valid_phones)))
+        text = re.sub(phone_pattern, "[private info removed]", text)
+
+    if hits:
+        score += 2.0 * hits
+
+    return text.strip(), round(score, 2)
 
 if __name__ == '__main__':
+    # sample_text = "faggot gmail@email.com gmail@email.com +358449525811"
+    # cleaned, score = moderate_content(sample_text)
+    # print("\nOriginal:", sample_text)
+    # print("Cleaned:", cleaned)
+    # print("Score:", score)
+
+    # print('\n-------------TIER1_WORDS-------------')
+    # print(TIER1_WORDS)
+    # print('\n-------------TIER2_PHRASES-------------')
+    # print(TIER2_PHRASES)
+    # print('\n-------------TIER3_WORDS-------------')
+    # print(TIER3_WORDS)
+
+    # print('\n========== Exercise 3.2: User Risk Analysis ==========\n')
+    
+    # with app.app_context():
+        # all_users = query_db('SELECT id, username FROM users ORDER BY id')
+        
+        # user_risks = []
+        
+        # print("Calculating risk scores...\n")
+        # test_user_ids = [11, 13, 66, 68, 541]
+
+        # for user in all_users:
+        #     if user['id'] in test_user_ids:
+        #         risk = user_risk_analysis(user['id'])
+        #         user_risks.append({
+        #             'id': user['id'],
+        #             'username': user['username'],
+        #             'score': risk
+        #         })
+        
+        # user_risks.sort(key=lambda x: x['score'], reverse=True)
+        
+        # print("\n\n===== Top 5 Highest Risk Users =====\n")
+        # print(f"{'Rank':<8}{'User ID':<12}{'Username':<25}{'Score':<12}{'Level'}")
+        # print("-" * 70)
+        
+        # for i, u in enumerate(user_risks[:5], 1):
+        #     if u['score'] >= 5.0:
+        #         level = "HIGH"
+        #     elif u['score'] >= 3.0:
+        #         level = "MEDIUM"
+        #     elif u['score'] >= 1.0:
+        #         level = "LOW"
+        #     else:
+        #         level = "NONE"
+            
+        #     print(f"{i:<8}{u['id']:<12}{u['username']:<25}{u['score']:<12.2f}{level}")
+        
+        # print("\n\n===== Test Cases =====\n")
+        
+        # for uid in test_user_ids:
+        #     found = next((u for u in user_risks if u['id'] == uid), None)
+        #     if found:
+        #         if found['score'] >= 5.0:
+        #             level = "HIGH"
+        #         elif found['score'] >= 3.0:
+        #             level = "MEDIUM"
+        #         elif found['score'] >= 1.0:
+        #             level = "LOW"
+        #         else:
+        #             level = "NONE"
+        #         print(f"User {uid} (@{found['username']}): Score = {found['score']:.2f}, Level = {level}")
+        #     else:
+        #         print(f"User {uid}: NOT FOUND")
+        
+        # print("\n" + "="*70 + "\n")
+
+    # print('\n\n========== Exercise 3.3: Recommendation Algorithm ==========\n')
+
+    # with app.app_context():
+    #     # Test Case 1: User with interests
+    #     test_user_id = 10  # Change to a user who has liked posts
+    #     print(f"Testing recommendations for User ID: {test_user_id}\n")
+        
+    #     # Get user's liked posts to show their interests
+    #     liked = query_db("""
+    #         SELECT p.content 
+    #         FROM posts p
+    #         JOIN reactions r ON r.post_id = p.id
+    #         WHERE r.user_id = ? AND r.reaction_type IN ('like', 'love', 'laugh', 'wow')
+    #         LIMIT 3
+    #     """, (test_user_id,))
+        
+    #     print("User's liked posts (showing interests):")
+    #     for i, post in enumerate(liked, 1):
+    #         content = post['content'][:100] + "..." if len(post['content']) > 100 else post['content']
+    #         print(f"  {i}. {content}")
+        
+    #     # Get recommendations
+    #     recommendations = recommend(test_user_id, False)
+        
+    #     print(f"\nRecommended Posts (Total: {len(recommendations)}):\n")
+    #     print(f"{'Rank':<8}{'Post ID':<12}{'Author':<20}{'Content Preview'}")
+    #     print("-" * 80)
+        
+    #     for i, rec in enumerate(recommendations, 1):
+    #         content = rec['content'][:50] + "..." if len(rec['content']) > 50 else rec['content']
+    #         print(f"{i:<8}{rec['id']:<12}{rec['username']:<20}{content}")
+        
+    #     # Test Case 2: Cold start user
+    #     print("\n\nTest Case 2: Cold Start User (No interactions)")
+    #     cold_start_recs = recommend(999999, False)  # Non-existent user
+    #     print(f"Fallback recommendations: {len(cold_start_recs)} posts returned")
+        
+    #     # Test Case 3: Logged out user
+    #     print("\nTest Case 3: Logged Out User")
+    #     logged_out_recs = recommend(None, False)
+    #     print(f"Popular posts for logged-out user: {len(logged_out_recs)} posts returned")
+        
+    #     print("\n" + "="*80 + "\n")
+
     app.run(debug=True, port=8080)
 
