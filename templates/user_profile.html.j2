@@ -1,3 +1,5 @@
+<!-- user_profile.html -->
+
 {% extends "base.html.j2" %}
 {% block content %}
 {% from "macros/user_macros.html.j2" import user_display%}
@@ -49,6 +51,24 @@
     </div>
   </div>
 
+  <!-- ===== 4.4: Reputation Card ===== -->
+  <div class="user-reputation-card col-lg-8 mx-auto mt-4">
+    <h4>🏆 Reputation Score</h4>
+    <div class="rep-display">
+        <span class="rep-score-large">{{ user.reputation_score }}</span>
+        <span class="rep-badge {{ user.reputation_badge_class }}">
+            {{ user.reputation_tier }}
+        </span>
+    </div>
+    <p class="mb-2">Based on last 60 days of activity</p>
+    <small>
+        <a href="{{ url_for('leaderboard') }}" style="color: white; text-decoration: underline;">
+            View Leaderboard →
+        </a>
+    </small>
+  </div>
+  <!-- ================================= -->
+   
   <h3 class="text-center border-bottom pb-2 my-5"><span>Latest Posts</span></h3>
 
   <div class="row g-3">

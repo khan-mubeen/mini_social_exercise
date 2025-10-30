@@ -7,7 +7,6 @@ import json
 import sqlite3
 import hashlib
 import re
-from datetime import datetime
 from email_validator import validate_email, EmailNotValidError
 import phonenumbers
 from datetime import datetime, timezone
@@ -134,6 +133,7 @@ def feed():
         for rec_post in recommended_posts:
             # Get additional data for each recommended post
             post_id = rec_post['id']
+            rec_post['author_score'] = get_author_score(rec_post['user_id']) # 4.4
             
             # Determine if the current user follows the poster
             followed_poster = False
@@ -186,14 +186,26 @@ def feed():
     
     # Handle popular and new posts (original logic)
     if sort == 'popular':
+        # 4.4 
+        # COALESCE(v.score, 0) AS author_score
+        # LEFT JOIN user_reputation_view v ON v.user_id = p.user_id
         query = f"""
-            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
-                   IFNULL(r.total_reactions, 0) as total_reactions
+            SELECT
+                p.id,
+                p.content,
+                p.created_at,
+                u.username,
+                u.id AS user_id,
+                IFNULL(r.total_reactions, 0) AS total_reactions,
+                COALESCE(v.score, 0) AS author_score
             FROM posts p
             JOIN users u ON p.user_id = u.id
             LEFT JOIN (
-                SELECT post_id, COUNT(*) as total_reactions FROM reactions GROUP BY post_id
+                SELECT post_id, COUNT(*) AS total_reactions
+                FROM reactions
+                GROUP BY post_id
             ) r ON p.id = r.post_id
+            LEFT JOIN user_reputation_view v ON v.user_id = p.user_id
             {where_clause}
             ORDER BY total_reactions DESC, p.created_at DESC
             LIMIT ? OFFSET ?
@@ -202,9 +214,16 @@ def feed():
         posts = query_db(query, final_params)
     else:  # Default sort is 'new'
         query = f"""
-            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            SELECT
+                p.id,
+                p.content,
+                p.created_at,
+                u.username,
+                u.id AS user_id,
+                COALESCE(v.score, 0) AS author_score
             FROM posts p
             JOIN users u ON p.user_id = u.id
+            LEFT JOIN user_reputation_view v ON v.user_id = p.user_id
             {where_clause}
             ORDER BY p.created_at DESC
             LIMIT ? OFFSET ?
@@ -240,6 +259,7 @@ def feed():
         comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],))
         post_dict = dict(post)
         post_dict['content'], _ = moderate_content(post_dict['content'])
+        post_dict['author_score'] = int(post['author_score'] if post['author_score'] is not None else 0) # 4.4
         comments_moderated = []
         for comment in comments_raw:
             comment_dict = dict(comment)
@@ -341,6 +361,12 @@ def user_profile(username):
     user = dict(user_raw)
     moderated_bio, _ = moderate_content(user.get('profile', ''))
     user['profile'] = moderated_bio
+    
+    # ===== 4.4: Add reputation score =====
+    user['reputation_score'] = get_author_score(user['id'])
+    user['reputation_tier'] = get_rep_tier(user['reputation_score'])
+    user['reputation_badge_class'] = get_rep_badge_class(user['reputation_score'])
+    # =====================================
 
     posts_raw = query_db('SELECT id, content, user_id, created_at FROM posts WHERE user_id = ? ORDER BY created_at DESC', (user['id'],))
     posts = []
@@ -361,11 +387,9 @@ def user_profile(username):
     followers_count = query_db('SELECT COUNT(*) as cnt FROM follows WHERE followed_id = ?', (user['id'],), one=True)['cnt']
     following_count = query_db('SELECT COUNT(*) as cnt FROM follows WHERE follower_id = ?', (user['id'],), one=True)['cnt']
 
-    #  NEW: CHECK FOLLOW STATUS 
-    is_currently_following = False # Default to False
+    is_currently_following = False
     current_user_id = session.get('user_id')
     
-    # We only need to check if a user is logged in
     if current_user_id:
         follow_relation = query_db(
             'SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?',
@@ -374,7 +398,6 @@ def user_profile(username):
         )
         if follow_relation:
             is_currently_following = True
-    # --
 
     return render_template('user_profile.html.j2', 
                            user=user, 
@@ -382,8 +405,7 @@ def user_profile(username):
                            comments=comments,
                            followers_count=followers_count, 
                            following_count=following_count,
-                           is_following=is_currently_following)
-    
+                           is_following=is_currently_following) 
 
 @app.route('/u/<username>/followers')
 def user_followers(username):
@@ -927,7 +949,127 @@ def loop_color(user_id):
     b = int(h[4:6], 16)
     return f'rgb({r % 128 + 80}, {g % 128 + 80}, {b % 128 + 80})'
 
+# ...........................................................................................
+# 4.4
+@app.template_filter('rep_tier')
+def rep_tier_filter(score):
+    return get_rep_tier(score)
 
+@app.template_filter('rep_badge_class')
+def rep_badge_class_filter(score):
+    return get_rep_badge_class(score)
+
+@app.route("/leaderboard")
+def leaderboard():
+    """
+    Top 10 users by reputation (last 60 days)
+    """
+    print("\n" + "="*80)
+    print("LEADERBOARD GENERATION - DEBUG LOG")
+    print("="*80)
+    
+    conn = get_db()
+    cur = conn.cursor()
+    
+    # check total users in system
+    cur.execute("SELECT COUNT(*) as total FROM users")
+    total_users = cur.fetchone()["total"]
+    print(f"Total users in system: {total_users}")
+    
+    # check how many users have reputation scores > 0
+    cur.execute("SELECT COUNT(*) as active FROM user_reputation_view WHERE score > 0")
+    active_users = cur.fetchone()["active"]
+    print(f"Users with reputation > 0: {active_users}")
+    
+    # fetch top 10
+    print(f"\nFetching top 10 users by reputation...")
+    cur.execute("""
+        SELECT u.id, u.username, COALESCE(v.score, 0) AS score
+        FROM users u
+        LEFT JOIN user_reputation_view v ON v.user_id = u.id
+        ORDER BY score DESC, u.username ASC
+        LIMIT 10
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    users = []
+    print(f"\nLEADERBOARD RESULTS:")
+    print("-" * 80)
+    print(f"{'Rank':<6} {'Username':<20} {'Score':<10} {'Tier':<15}")
+    print("-" * 80)
+    
+    for idx, r in enumerate(rows, start=1):
+        score = int(r["score"] or 0)
+        tier = get_rep_tier(score)
+        
+        print(f"#{idx:<4} {r['username']:<20} {score:<10} {tier:<15}")
+        
+        users.append({
+            "id": r["id"],
+            "username": r["username"],
+            "score": score,
+            "tier": tier,
+        })
+    
+    print("-" * 80)
+    
+    # calculate tier distribution
+    tier_counts = {}
+    for u in users:
+        tier = u["tier"]
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+    
+    print(f"\nTIER DISTRIBUTION (Top 10):")
+    for tier in ["Mentor", "Trusted", "Contributor", "New"]:
+        count = tier_counts.get(tier, 0)
+        if count > 0:
+            bar = "█" * count
+            print(f"  {tier:<15} {bar} ({count} users)")
+    
+    print("\nLeaderboard rendered successfully!")
+    print("="*80 + "\n")
+    
+    return render_template("leaderboard.html.j2", users=users)
+
+# helpers
+def get_rep_tier(score: int) -> str:
+    """
+    Return tier label based on reputation score
+    """
+    if score >= 30:
+        return "Mentor"
+    elif score >= 15:
+        return "Trusted"
+    elif score >= 5:
+        return "Contributor"
+    else:
+        return "New"
+
+def get_rep_badge_class(score: int) -> str:
+    """
+    Return CSS class for reputation badge
+    """
+    if score >= 30:
+        return "rep-badge-mentor"
+    elif score >= 15:
+        return "rep-badge-trusted"
+    elif score >= 5:
+        return "rep-badge-contrib"
+    else:
+        return "rep-badge-new"
+
+def get_author_score(user_id: int) -> int:
+    """
+    Get reputation score for a user from the view
+    """
+    row = query_db(
+        "SELECT COALESCE(score, 0) AS s FROM user_reputation_view WHERE user_id = ?",
+        (user_id,), 
+        one=True
+    )
+    return int(row["s"]) if row else 0
+# ...........................................................................................
 
 # ----- Functions to be implemented are below
 

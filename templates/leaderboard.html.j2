@@ -1,0 +1,188 @@
+{% extends "base.html.j2" %}
+{% block content %}
+  <div class="container" style="max-width: 950px; margin-top: 30px;">
+    
+    <!-- Header Section -->
+    <div class="text-center mb-5">
+      <h1 style="font-size: 2.5em; font-weight: bold;">🏆 Reputation Leaderboard</h1>
+      <p class="text-muted" style="font-size: 1.1em;">
+          Top 10 users by reputation (last 60 days)
+      </p>
+      <p class="text-secondary">
+          <strong>Score = 2 × likes on posts + 3 × unique commenters</strong>
+      </p>
+    </div>
+
+    <!-- Leaderboard Table -->
+    <div class="card shadow-lg">
+      <div class="card-body p-0">
+        <table class="table table-hover mb-0">
+          <thead style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white;">
+            <tr>
+              <th style="width: 100px; text-align: center; padding: 15px;">Rank</th>
+              <th style="padding: 15px;">User</th>
+              <th style="width: 220px; padding: 15px; text-align: center;">Tier</th>
+              <th style="width: 130px; text-align: center; padding: 15px;">Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for u in users %}
+              <tr class="leaderboard-row {% if loop.index <= 3 %}top-three-highlight{% endif %}">
+                
+                <!-- Rank Column with Medals -->
+                <td style="text-align: center; vertical-align: middle;">
+                    <div class="rank-display">
+                      {% if loop.index == 1 %}
+                        <span style="font-size: 2.5em;">🥇</span>
+                      {% elif loop.index == 2 %}
+                        <span style="font-size: 2.2em;">🥈</span>
+                      {% elif loop.index == 3 %}
+                        <span style="font-size: 2em;">🥉</span>
+                      {% else %}
+                        <span style="font-size: 1.5em; font-weight: 600; color: #6c757d;">{{ loop.index }}</span>
+                      {% endif %}
+                    </div>
+                </td>
+
+                <!-- User Column -->
+                <td style="vertical-align: middle;">
+                    <a href="{{ url_for('user_profile', username=u.username) }}" 
+                       style="text-decoration: none; font-size: 1.1em;">
+                        <strong>@{{ u.username }}</strong>
+                    </a>
+                </td>
+
+                <!-- Tier Badge Column -->
+                <td style="vertical-align: middle; text-align: center;">
+                  <span class="rep-badge {{ u.score | rep_badge_class }}" 
+                        style="font-size: 0.95em; padding: 6px 14px;">
+                    {{ u.tier }}
+                  </span>
+                </td>
+
+                <!-- Score Column -->
+                <td style="text-align: center; vertical-align: middle;">
+                    <span style="font-size: 1.3em; font-weight: bold; color: #667eea;">
+                      {{ u.score }}
+                    </span>
+                    <span style="color: #6c757d; font-size: 0.9em;">pts</span>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- How It Works Section -->
+    <div class="row mt-5 g-3">
+      <div class="col-md-6">
+        <div class="card h-100 shadow-sm">
+          <div class="card-body">
+            <h5 class="card-title">
+              <span style="font-size: 1.5em;">📊</span> How Reputation Works:
+            </h5>
+            <ul class="list-unstyled mt-3">
+              <li class="mb-2">
+                <strong style="color: #28a745;">+2 points</strong> 
+                for each "like" reaction on your posts
+              </li>
+              <li class="mb-2">
+                <strong style="color: #17a2b8;">+3 points</strong> 
+                for each unique user who comments on your posts
+              </li>
+              <li class="mb-2">
+                <span class="text-muted">Scores are calculated from the</span>
+                <strong> last 60 days</strong> 
+                <span class="text-muted">of activity</span>
+              </li>
+              <li>
+                <em style="color: #667eea;">💡 More engagement = higher reputation!</em>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- Reputation Tiers Section -->
+      <div class="col-md-6">
+        <div class="card h-100 shadow-sm">
+          <div class="card-body">
+            <h5 class="card-title">
+              <span style="font-size: 1.5em;">🎖️</span> Reputation Tiers:
+            </h5>
+            <div class="mt-3">
+              <div class="mb-3">
+                <span class="rep-badge rep-badge-new" style="padding: 8px 16px; font-size: 0.95em;">
+                  New
+                </span>
+                <span class="ms-2 text-muted">0-49 points</span>
+              </div>
+              <div class="mb-3">
+                <span class="rep-badge rep-badge-contrib" style="padding: 8px 16px; font-size: 0.95em;">
+                  Contributor
+                </span>
+                <span class="ms-2 text-muted">50-149 points</span>
+              </div>
+              <div class="mb-3">
+                <span class="rep-badge rep-badge-trusted" style="padding: 8px 16px; font-size: 0.95em;">
+                  Trusted
+                </span>
+                <span class="ms-2 text-muted">150-299 points</span>
+              </div>
+              <div>
+                <span class="rep-badge rep-badge-mentor" style="padding: 8px 16px; font-size: 0.95em;">
+                  Mentor
+                </span>
+                <span class="ms-2 text-muted">300+ points</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Back Button -->
+    <div class="text-center mt-5 mb-4">
+        <a href="{{ url_for('feed') }}" class="btn btn-primary btn-lg">
+          ← Back to Feed
+        </a>
+    </div>
+
+  </div>
+
+  <!-- Additional Styles -->
+  <style>
+    .leaderboard-row {
+      transition: all 0.2s ease;
+    }
+
+    .leaderboard-row:hover {
+      background-color: #f8f9fa !important;
+      transform: scale(1.01);
+    }
+
+    .top-three-highlight {
+      background: linear-gradient(90deg, #fff9e6 0%, #ffffff 100%);
+      font-weight: 500;
+    }
+
+    .top-three-highlight:hover {
+      background: linear-gradient(90deg, #fff3cd 0%, #f8f9fa 100%) !important;
+    }
+
+    .rank-display {
+      padding: 10px 0;
+    }
+
+    .card {
+      border: none;
+      border-radius: 12px;
+    }
+
+    .card-title {
+      color: #667eea;
+      font-weight: 600;
+    }
+  </style>
+{% endblock %}
